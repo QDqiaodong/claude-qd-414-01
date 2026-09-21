@@ -1,0 +1,147 @@
+<template>
+  <div class="cell-page">
+    <div class="left">
+      <div class="left-head">
+        <span>库间 / 货位 树</span>
+        <el-button type="primary" size="small" @click="showAdd = true">新增库间</el-button>
+      </div>
+      <el-tree
+        class="tree"
+        :data="treeData"
+        :props="{ label: 'label', children: 'children' }"
+        node-key="id"
+        default-expand-all
+        @node-click="onNodeClick"
+      />
+    </div>
+
+    <div class="right" v-if="selectedCell">
+      <h3>库间详情（软删除演示）</h3>
+      <el-form label-width="90px">
+        <el-form-item label="编号"><el-input v-model="form.code" /></el-form-item>
+        <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
+        <el-form-item label="温区">
+          <el-select v-model="form.tempZone" style="width:100%">
+            <el-option label="冷冻" value="冷冻" />
+            <el-option label="冷藏" value="冷藏" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="容量(箱)"><el-input-number v-model="form.capacity" :min="0" /></el-form-item>
+        <el-form-item>
+          <el-button type="primary" @click="saveCell">保存修改</el-button>
+          <el-button type="danger" @click="removeCell">软删除该库间</el-button>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        type="info"
+        :closable="false"
+        title="软删除后：该库间从树中消失（list 自动过滤 deleted=1），但其下货位仍可在「货位」页查询到。"
+      />
+      <p class="meta">创建：{{ selectedCell.createdAt }}　修改：{{ selectedCell.updatedAt }}</p>
+    </div>
+    <div class="right empty" v-else>
+      <el-empty description="点击左侧库间查看详情" />
+    </div>
+
+    <el-dialog v-model="showAdd" title="新增库间" width="420px">
+      <el-form label-width="90px">
+        <el-form-item label="编号"><el-input v-model="add.code" placeholder="如 A库-07" /></el-form-item>
+        <el-form-item label="名称"><el-input v-model="add.name" /></el-form-item>
+        <el-form-item label="温区">
+          <el-select v-model="add.tempZone" style="width:100%">
+            <el-option label="冷冻" value="冷冻" />
+            <el-option label="冷藏" value="冷藏" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="容量(箱)"><el-input-number v-model="add.capacity" :min="0" /></el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showAdd = false">取消</el-button>
+        <el-button type="primary" @click="createCell">创建</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, computed } from 'vue'
+import http from '../api'
+
+const cells = ref([])
+const locations = ref([])
+const selectedCell = ref(null)
+const showAdd = ref(false)
+const add = ref({ code: '', name: '', tempZone: '冷冻', capacity: 100 })
+const form = ref({ code: '', name: '', tempZone: '冷冻', capacity: 0 })
+
+const treeData = computed(() => {
+  return cells.value.map(c => ({
+    id: 'cell-' + c.id,
+    type: 'cell',
+    data: c,
+    label: `${c.code} ${c.name}（${c.tempZone}·${c.capacity}箱）`,
+    children: locations.value
+      .filter(l => l.cellId === c.id)
+      .map(l => ({
+        id: 'loc-' + l.id,
+        type: 'loc',
+        data: l,
+        label: `${l.code} [${l.status}]`
+      }))
+  }))
+})
+
+async function load() {
+  const [c, l] = await Promise.all([http.get('/cells'), http.get('/locations')])
+  cells.value = c
+  locations.value = l
+}
+
+function onNodeClick(node) {
+  if (node.type === 'cell') {
+    selectedCell.value = node.data
+    form.value = {
+      code: node.data.code,
+      name: node.data.name,
+      tempZone: node.data.tempZone,
+      capacity: node.data.capacity
+    }
+  }
+}
+
+async function saveCell() {
+  await http.put('/cells/' + selectedCell.value.id, { ...form.value })
+  await load()
+}
+
+async function removeCell() {
+  await http.delete('/cells/' + selectedCell.value.id)
+  selectedCell.value = null
+  await load()
+}
+
+async function createCell() {
+  await http.post('/cells', { ...add.value })
+  showAdd.value = false
+  add.value = { code: '', name: '', tempZone: '冷冻', capacity: 100 }
+  await load()
+}
+
+onMounted(load)
+</script>
+
+<style scoped>
+.cell-page { display: flex; gap: 16px; height: 100%; }
+.left {
+  width: 320px; background: #fff; border-radius: 10px; padding: 14px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; flex-direction: column;
+}
+.left-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-weight: 700; }
+.tree { flex: 1; overflow: auto; }
+.right {
+  flex: 1; background: #fff; border-radius: 10px; padding: 18px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+}
+.right.empty { display: flex; align-items: center; justify-content: center; }
+.meta { color: #999; font-size: 12px; margin-top: 12px; }
+</style>

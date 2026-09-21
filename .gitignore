@@ -1,0 +1,13 @@
+node_modules/
+dist/
+target/
+docker/data/
+docker/logs/
+logs/
+*.log
+*.tmp
+tmp/
+.DS_Store
+.idea/
+.vscode/
+.trae/
