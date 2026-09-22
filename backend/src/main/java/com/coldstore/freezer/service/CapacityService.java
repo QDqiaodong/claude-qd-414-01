@@ -1,8 +1,11 @@
 package com.coldstore.freezer.service;
 
 import com.coldstore.freezer.dto.BizException;
+import com.coldstore.freezer.dto.CapacityCommitment;
 import com.coldstore.freezer.dto.CapacityView;
+import com.coldstore.freezer.entity.Batch;
 import com.coldstore.freezer.entity.Cell;
+import com.coldstore.freezer.entity.Reservation;
 import com.coldstore.freezer.repository.BatchRepository;
 import com.coldstore.freezer.repository.CellRepository;
 import com.coldstore.freezer.repository.DefrostWindowRepository;
@@ -62,6 +65,23 @@ public class CapacityService {
         Cell cell = cellRepository.findById(cellId)
                 .orElseThrow(() -> new BizException("库间不存在或已删除"));
         return remaining(cell);
+    }
+
+    /**
+     * 容量变更下限的最新构成：已在库 + 仍待入 + 已确认未核销预占。
+     * 必须在拿到库间行锁之后调用（READ_COMMITTED），等锁期间对方提交的预占确认、
+     * 批次入库/撤销都会在这里读到，绝不能用调用方打开旧页面时的旧口径判断。
+     */
+    public CapacityCommitment commitment(Cell lockedCell) {
+        Long cellId = lockedCell.getId();
+        int inStock = nz(batchRepository.sumInStockQtyByCellId(cellId));
+        int pending = nz(batchRepository.sumPendingQtyByCellId(cellId));
+        int reserved = nz(reservationRepository.sumConfirmedQtyByCellId(cellId));
+        List<Batch> inStockBatches = batchRepository.findByCellIdAndStatus(cellId, "在库");
+        List<Batch> pendingBatches = batchRepository.findByCellIdAndStatus(cellId, "待入");
+        List<Reservation> confirmed = reservationRepository.findByCellIdAndStatusOrderByIdAsc(cellId, "已确认");
+        return new CapacityCommitment(inStock, pending, reserved,
+                inStockBatches, pendingBatches, confirmed);
     }
 
     @Transactional(readOnly = true)

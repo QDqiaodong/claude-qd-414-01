@@ -16,7 +16,7 @@
     </div>
 
     <div class="right" v-if="selectedCell">
-      <h3>库间详情（软删除演示）</h3>
+      <h3>库间详情（容量变更可审计）</h3>
       <el-form label-width="90px">
         <el-form-item label="编号"><el-input v-model="form.code" /></el-form-item>
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
@@ -26,12 +26,47 @@
             <el-option label="冷藏" value="冷藏" />
           </el-select>
         </el-form-item>
-        <el-form-item label="容量(箱)"><el-input-number v-model="form.capacity" :min="0" /></el-form-item>
+        <el-form-item label="容量(箱)">
+          <el-input-number v-model="form.capacity" :min="0" :step="10" />
+        </el-form-item>
         <el-form-item>
-          <el-button type="primary" @click="saveCell">保存修改</el-button>
+          <el-button type="primary" :loading="saving" @click="saveCell">保存修改</el-button>
           <el-button type="danger" @click="removeCell">软删除该库间</el-button>
         </el-form-item>
       </el-form>
+
+      <el-alert
+        v-if="cap"
+        :type="cap.remaining > 0 && !cap.defrostOngoing ? 'success' : 'error'"
+        :closable="false"
+        show-icon
+        class="cap-alert"
+        :title="'容量总览（后端唯一口径）：容量 ' + cap.capacity
+          + ' ＝ 在库 ' + cap.inStockQty
+          + ' ＋ 待入 ' + cap.pendingQty
+          + ' ＋ 已确认预占 ' + cap.reservedQty
+          + ' ＋ 剩余可收 ' + (cap.defrostOngoing ? 0 : cap.remaining)
+          + (cap.defrostOngoing ? '（化霜进行中，剩余按 0）' : '')"
+      />
+      <el-alert
+        v-if="cap"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="cap-alert"
+        :title="'容量下调下限：' + floor
+          + ' 箱 = 已在库 ' + cap.inStockQty
+          + ' ＋ 仍待入 ' + cap.pendingQty
+          + ' ＋ 已确认未核销预占 ' + cap.reservedQty
+          + '。填负数、空容量或低于该下限，后端都会驳回，原容量、库存、预占保持不变。'"
+      />
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        class="cap-alert"
+        title="容量修改与他人确认预占在同一库间行锁上串行判断：你先改小，后到的确认按新余量被驳回；对方先确认，你保存时会把那张已确认预占计入下限而被驳回。输入框 min 仅作提示，真正校验在后端事务与行锁内完成。"
+      />
       <el-alert
         type="info"
         :closable="false"
@@ -69,8 +104,10 @@ import http from '../api'
 
 const cells = ref([])
 const locations = ref([])
+const capacities = ref([])
 const selectedCell = ref(null)
 const showAdd = ref(false)
+const saving = ref(false)
 const add = ref({ code: '', name: '', tempZone: '冷冻', capacity: 100 })
 const form = ref({ code: '', name: '', tempZone: '冷冻', capacity: 0 })
 
@@ -91,10 +128,38 @@ const treeData = computed(() => {
   }))
 })
 
+/** 当前选中库间的容量总览（容量/在库/待入/已预占/剩余，与预占页、批次页同一接口同一口径） */
+const cap = computed(() =>
+  capacities.value.find(v => v.cellId === selectedCell.value?.id) || null
+)
+const floor = computed(() => cap.value
+  ? cap.value.inStockQty + cap.value.pendingQty + cap.value.reservedQty
+  : 0)
+
 async function load() {
-  const [c, l] = await Promise.all([http.get('/cells'), http.get('/locations')])
+  const [c, l, capList] = await Promise.all([
+    http.get('/cells'),
+    http.get('/locations'),
+    http.get('/cells/capacity/overview')
+  ])
   cells.value = c
   locations.value = l
+  capacities.value = capList
+  // 选中库间的容量/审计时间可能已被他人改动：选中态与表单同步为后端最新值
+  if (selectedCell.value) {
+    const fresh = c.find(x => x.id === selectedCell.value.id)
+    if (fresh) {
+      selectedCell.value = fresh
+      form.value = {
+        code: fresh.code,
+        name: fresh.name,
+        tempZone: fresh.tempZone,
+        capacity: fresh.capacity
+      }
+    } else {
+      selectedCell.value = null
+    }
+  }
 }
 
 function onNodeClick(node) {
@@ -110,8 +175,16 @@ function onNodeClick(node) {
 }
 
 async function saveCell() {
-  await http.put('/cells/' + selectedCell.value.id, { ...form.value })
-  await load()
+  saving.value = true
+  try {
+    // 旧页面提交 / 绕过页面直发 / 负数或空容量，后端都会明确驳回；
+    // 无论保存成功还是被驳回，都重新拉取库间详情、容量总览，表单回到最新口径，
+    // 绝不停留在「输入了一个数字但库里是另一套」的错觉上。
+    await http.put('/cells/' + selectedCell.value.id, { ...form.value })
+  } finally {
+    saving.value = false
+    await load()
+  }
 }
 
 async function removeCell() {
@@ -140,8 +213,9 @@ onMounted(load)
 .tree { flex: 1; overflow: auto; }
 .right {
   flex: 1; background: #fff; border-radius: 10px; padding: 18px;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+  box-shadow: 0 2px 10px rgba(0,0,0,0.05); overflow: auto;
 }
 .right.empty { display: flex; align-items: center; justify-content: center; }
+.cap-alert { margin-bottom: 10px; }
 .meta { color: #999; font-size: 12px; margin-top: 12px; }
 </style>

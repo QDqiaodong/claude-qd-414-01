@@ -36,21 +36,19 @@ public class BatchService {
         this.inspectionRepository = inspectionRepository;
     }
 
-    private void assertCellValid(Long cellId) {
-        if (cellId == null) {
-            throw new BizException("归属库间不能为空");
-        }
-        Cell cell = cellRepository.findById(cellId).orElse(null);
-        if (cell == null) {
-            throw new BizException("归属库间不存在或已删除");
-        }
-    }
-
+    /**
+     * 开立待入批次。待入箱数本身就计入容量下限，因此这里同样先拿库间行锁，
+     * 与容量下调、预占确认在同一串行点上排队，保证下限永远基于最新承诺计算。
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public Batch create(BatchReq req) {
         if (req.getCellId() == null) {
             throw new BizException("归属库间不能为空");
         }
-        assertCellValid(req.getCellId());
+        Cell cell = cellRepository.findActiveByIdForUpdate(req.getCellId()).orElse(null);
+        if (cell == null) {
+            throw new BizException("归属库间不存在或已删除");
+        }
         if (req.getCargo() == null || req.getCargo().isBlank()) {
             throw new BizException("货品名不能为空");
         }
@@ -75,11 +73,30 @@ public class BatchService {
                 .orElseThrow(() -> new BizException("入库批次不存在"));
     }
 
-    @Transactional
+    /**
+     * 改批次。改待入箱数 / 把待入批次挪到别的库间都会移动容量下限，
+     * 所以涉及的库间（原库间、新库间）一律先按 id 升序拿行锁再改，
+     * 与容量下调、预占确认、新待入批次走同一套锁定顺序，避免互相读到旧口径或死锁。
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public Batch update(Long id, BatchReq req) {
         Batch batch = get(id);
+        Long oldCellId = batch.getCellId();
+        Long newCellId = req.getCellId() != null ? req.getCellId() : oldCellId;
+        if (!newCellId.equals(oldCellId)) {
+            // 先锁小 id 再锁大 id，任何跨库间动作都保持同一加锁顺序
+            for (Long cid : newCellId < oldCellId
+                    ? List.of(newCellId, oldCellId) : List.of(oldCellId, newCellId)) {
+                if (cellRepository.findActiveByIdForUpdate(cid).isEmpty()) {
+                    throw new BizException("归属库间不存在或已删除");
+                }
+            }
+        } else {
+            if (cellRepository.findActiveByIdForUpdate(newCellId).isEmpty()) {
+                throw new BizException("归属库间不存在或已删除");
+            }
+        }
         if (req.getCellId() != null && !req.getCellId().equals(batch.getCellId())) {
-            assertCellValid(req.getCellId());
             batch.setCellId(req.getCellId());
         }
         if (req.getCargo() != null) {

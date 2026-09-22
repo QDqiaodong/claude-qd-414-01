@@ -76,21 +76,32 @@ public class ReservationService {
     }
 
     /**
-     * 确认预占：库间行上锁串行化争抢（READ_COMMITTED 保证等锁后能看到对方已提交的预占）。
+     * 确认预占。串行点是库间行锁：容量变更、化霜占窗开立、待入批次开立都在同一把
+     * 锁上排队（READ_COMMITTED 保证等锁后读到对方已提交的最新数据）。
+     * 顺序固定为「先库间行锁、再预占行锁」，与系统里其他加锁动作保持同一锁定顺序：
+     *   1) 先定位预占（普通读，仅用于找到库间与 404）；
+     *   2) 锁库间行——同一库间的容量下调 / 其他预占确认在此严格串行；
+     *   3) 锁到库间后再对预占行加锁并按最新状态复核，杜绝「等锁前读到待确认、
+     *      等锁后别人已确认」的旧快照漏判；
      * 进行中的化霜占窗直接按剩余 0，不能确认；
      * 剩余箱数不够时当场驳回并说清当时还剩多少；
      * 预占开立后被一扇化霜占窗盖过（哪怕已经结束），这张草稿必须作废重开。
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public Reservation confirm(Long id) {
-        Reservation r = reservationRepository.findById(id)
+        Reservation located = reservationRepository.findById(id)
+                .orElseThrow(() -> new BizException("预占不存在"));
+        Long cellId = located.getCellId();
+        // 与容量下调同一串行点：谁先拿到这把库间行锁，谁先按当时口径落结果
+        Cell cell = cellRepository.findActiveByIdForUpdate(cellId).orElse(null);
+        if (cell == null) {
+            throw new BizException("库间已软删，预占不能再确认");
+        }
+        // 等锁期间状态可能已被另一笔确认/核销改掉：以锁后重新读到的最新状态为准
+        Reservation r = reservationRepository.findLockedById(id)
                 .orElseThrow(() -> new BizException("预占不存在"));
         if (!"待确认".equals(r.getStatus())) {
             throw new BizException("只有「待确认」的预占可以确认，当前为「" + r.getStatus() + "」");
-        }
-        Cell cell = cellRepository.findActiveByIdForUpdate(r.getCellId()).orElse(null);
-        if (cell == null) {
-            throw new BizException("库间已软删，预占不能再确认");
         }
         LocalDateTime now = LocalDateTime.now();
         if (!defrostWindowRepository.findOngoing(cell.getId(), now).isEmpty()) {

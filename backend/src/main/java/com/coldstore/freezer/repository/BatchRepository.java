@@ -16,6 +16,9 @@ public interface BatchRepository extends JpaRepository<Batch, Long> {
     List<Batch> findByCellId(Long cellId);
     List<Batch> findByStatus(String status);
 
+    /** 某库间指定状态（在库/待入）的全部批次：容量变更驳回时逐笔列明是哪些承诺撑住了下限 */
+    List<Batch> findByCellIdAndStatus(Long cellId, String status);
+
     /** 行级锁取批次：入库 / 撤销争抢同一笔批次时在此串行，状态与预占核销只许落成一个结果 */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select b from Batch b where b.id = :id")

@@ -24,6 +24,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.test.web.servlet.MockMvc;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -38,6 +41,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest
+@AutoConfigureMockMvc
 @ActiveProfiles("test")
 class ColdStoreAcceptanceTest {
 
@@ -49,7 +53,10 @@ class ColdStoreAcceptanceTest {
     @Autowired BatchService batchService;
     @Autowired InspectionService inspectionService;
     @Autowired CapacityService capacityService;
+    @Autowired com.coldstore.freezer.service.CellService cellService;
     @Autowired JdbcTemplate jdbcTemplate;
+    @Autowired MockMvc mockMvc;
+    @Autowired com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
     private long frozenCell;   // 冷冻，容量 100
     private long chilledCell;  // 冷藏，容量 100
@@ -188,6 +195,384 @@ class ColdStoreAcceptanceTest {
         Reservation r = createReservation(cellId, cargo, qty);
         reservationService.confirm(r.getId());
         return r.getId();
+    }
+
+    private com.coldstore.freezer.dto.CellReq cellReq(Long codeCellId, Integer capacity) {
+        Cell base = cellService.get(codeCellId);
+        com.coldstore.freezer.dto.CellReq req = new com.coldstore.freezer.dto.CellReq();
+        req.setCode(base.getCode());
+        req.setName(base.getName());
+        req.setTempZone(base.getTempZone());
+        req.setCapacity(capacity);
+        return req;
+    }
+
+    private int dbCapacity(long cellId) {
+        Integer v = jdbcTemplate.queryForObject(
+                "select capacity from cell where id = ?", Integer.class, cellId);
+        return v == null ? -1 : v;
+    }
+
+    // ---------- 容量变更收紧 ----------
+
+    @Test
+    void capacity_cannot_shrink_below_instock_plus_pending_plus_confirmed_reservation() {
+        // 在库 30、待入 20、已确认未核销预占 25，下限 = 75
+        Batch in = createPendingBatch(frozenCell, "虾", 30);
+        batchService.stockIn(in.getId(), reserveFor(frozenCell, "虾", 30));
+        createPendingBatch(frozenCell, "鱼", 20);
+        Long rid = createReservation(frozenCell, "贝", 25).getId();
+        reservationService.confirm(rid);
+
+        // 改到下限 75：刚好允许，剩余变 0
+        Cell ok = cellService.update(frozenCell, cellReq(frozenCell, 75));
+        assertEquals(75, ok.getCapacity().intValue());
+        assertEquals(0, capacityService.remaining(frozenCell));
+        assertEquals(75, capacityService.view(frozenCell).getCapacity());
+
+        // 改到 74：驳回，并逐项点清是哪些承诺撑住了下限
+        BizException ex = assertThrows(BizException.class,
+                () -> cellService.update(frozenCell, cellReq(frozenCell, 74)));
+        String msg = ex.getMessage();
+        assertTrue(msg.contains("75"), msg);
+        assertTrue(msg.contains("预占#" + rid), "要点名是哪一笔已确认预占超限：" + msg);
+        assertTrue(msg.contains("待入"), msg);
+        assertTrue(msg.contains("在库"), msg);
+
+        // 驳回后容量、库存、预占状态一律原样
+        assertEquals(75, dbCapacity(frozenCell));
+        assertEquals(30, capacityService.view(frozenCell).getInStockQty());
+        assertEquals(20, capacityService.view(frozenCell).getPendingQty());
+        assertEquals(25, capacityService.view(frozenCell).getReservedQty());
+        assertEquals("已确认", reservationService.get(rid).getStatus());
+        assertEquals(0, capacityService.remaining(frozenCell));
+
+        // 出库 / 撤销待入让下限降下来后，再下调即可成功
+        batchService.stockOut(in.getId());
+        cellService.update(frozenCell, cellReq(frozenCell, 45)); // 待入20+预占25
+        assertEquals(45, dbCapacity(frozenCell));
+    }
+
+    @Test
+    void null_or_negative_capacity_rejected_and_everything_stays_untouched() {
+        Long rid = reserveFor(frozenCell, "占位", 40);
+        createPendingBatch(frozenCell, "待收货", 10);
+
+        // 负数（绕过输入框直接请求）
+        BizException neg = assertThrows(BizException.class,
+                () -> cellService.update(frozenCell, cellReq(frozenCell, -5)));
+        assertTrue(neg.getMessage().contains("负数"), neg.getMessage());
+        // 空容量（旧表单 / 直连接口漏传）
+        BizException empty = assertThrows(BizException.class,
+                () -> cellService.update(frozenCell, cellReq(frozenCell, null)));
+        assertTrue(empty.getMessage().contains("容量不能为空"), empty.getMessage());
+
+        assertEquals(100, dbCapacity(frozenCell), "驳回不得改动原容量");
+        assertEquals(40, capacityService.view(frozenCell).getReservedQty());
+        assertEquals(10, capacityService.view(frozenCell).getPendingQty());
+        assertEquals("已确认", reservationService.get(rid).getStatus());
+    }
+
+    /** 绕过页面直接打接口：负数 / 空容量 / 低于下限都必须 400 + 明确错误，状态原样 */
+    @Test
+    void direct_http_put_with_bad_capacity_gets_400_and_state_untouched() throws Exception {
+        Long rid = reserveFor(frozenCell, "占位", 60); // 下限 60
+        Cell base = cellService.get(frozenCell);
+
+        // 负数
+        String negBody = objectMapper.writeValueAsString(java.util.Map.of(
+                "code", base.getCode(), "name", base.getName(),
+                "tempZone", base.getTempZone(), "capacity", -9));
+        org.springframework.test.web.servlet.MvcResult neg = mockMvc.perform(
+                        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                                .put("/api/cells/" + frozenCell)
+                                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                                .content(negBody))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest())
+                .andReturn();
+        assertTrue(neg.getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8).contains("负数"));
+
+        // 空容量（字段缺失）
+        String missingBody = objectMapper.writeValueAsString(java.util.Map.of(
+                "code", base.getCode(), "name", base.getName(), "tempZone", base.getTempZone()));
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .put("/api/cells/" + frozenCell)
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(missingBody))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers
+                        .jsonPath("$.message", org.hamcrest.Matchers.containsString("容量不能为空")));
+
+        // 低于下限：点名是哪一笔预占撑住的
+        String lowBody = objectMapper.writeValueAsString(java.util.Map.of(
+                "code", base.getCode(), "name", base.getName(),
+                "tempZone", base.getTempZone(), "capacity", 59));
+        org.springframework.test.web.servlet.MvcResult low = mockMvc.perform(
+                        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                                .put("/api/cells/" + frozenCell)
+                                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                                .content(lowBody))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest())
+                .andReturn();
+        assertTrue(low.getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8).contains("预占#" + rid),
+                low.getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8));
+
+        assertEquals(100, dbCapacity(frozenCell));
+        assertEquals("已确认", reservationService.get(rid).getStatus());
+        assertEquals(40, capacityService.remaining(frozenCell));
+
+        // 合法下调到下限 60：成功
+        String okBody = objectMapper.writeValueAsString(java.util.Map.of(
+                "code", base.getCode(), "name", base.getName(),
+                "tempZone", base.getTempZone(), "capacity", 60));
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .put("/api/cells/" + frozenCell)
+                        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                        .content(okBody))
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
+        assertEquals(60, dbCapacity(frozenCell));
+    }
+
+    @Test
+    void create_cell_requires_non_null_non_negative_capacity() {
+        com.coldstore.freezer.dto.CellReq bad = new com.coldstore.freezer.dto.CellReq();
+        bad.setCode("NEW-CELL");
+        bad.setName("新间");
+        bad.setTempZone("冷冻");
+        bad.setCapacity(null);
+        assertThrows(BizException.class, () -> cellService.create(bad));
+        bad.setCapacity(-1);
+        assertThrows(BizException.class, () -> cellService.create(bad));
+        assertFalse(cellRepository.existsByCode("NEW-CELL"));
+    }
+
+    /**
+     * 入库只会让容量下限下降（待入 −q、已确认预占 −q、在库 +q，净 −q），
+     * 所以容量变更与入库即便不互斥，也不可能把容量落到一个「低于最终承诺」的结果：
+     * 等锁后的口径只会偏大（多算一笔旧待入/旧预占）导致当场驳回，而不会偏小误放行。
+     */
+    @Test
+    void stock_in_only_lowers_the_floor_so_capacity_change_never_accepts_below_commitments() {
+        // 下限先为 待入40 + 已确认40 = 80
+        Batch b = createPendingBatch(frozenCell, "羊排", 40);
+        Long rid = reserveFor(frozenCell, "羊排", 40);
+        cellService.update(frozenCell, cellReq(frozenCell, 80)); // 贴着下限改小
+        assertEquals(0, capacityService.remaining(frozenCell));
+
+        // 入库后：在库40，下限 40。此前已落库的容量 80 仍 ≥ 40，口径自洽
+        batchService.stockIn(b.getId(), rid);
+        var v = capacityService.view(frozenCell);
+        assertEquals(40, v.getInStockQty());
+        assertEquals(0, v.getPendingQty());
+        assertEquals(0, v.getReservedQty());
+        assertEquals(80, v.getCapacity());
+        assertEquals(40, v.getRemaining());
+
+        // 入库先发生后，容量可以继续下调到新下限 40；反过来容量贴着 80 已落库时入库照常
+        cellService.update(frozenCell, cellReq(frozenCell, 40));
+        assertEquals(40, dbCapacity(frozenCell));
+        assertEquals(0, capacityService.remaining(frozenCell));
+    }
+
+    @Test
+    void capacity_increase_takes_effect_everywhere_on_same_caliber() {
+        Long rid = reserveFor(frozenCell, "贝", 25);
+        cellService.update(frozenCell, cellReq(frozenCell, 120));
+        // 容量总览（overview 与单库间明细同入口同口径）
+        var v = capacityService.view(frozenCell);
+        assertEquals(120, v.getCapacity());
+        assertEquals(25, v.getReservedQty());
+        assertEquals(95, v.getRemaining());
+        var overview = capacityService.viewAll().stream()
+                .filter(x -> x.getCellId() == frozenCell).findFirst().orElseThrow();
+        assertEquals(120, overview.getCapacity());
+        assertEquals(95, overview.getRemaining());
+        // 新口径下原本放不下的预占可以确认
+        Reservation r2 = createReservation(frozenCell, "蟹", 90);
+        assertDoesNotThrow(() -> reservationService.confirm(r2.getId()));
+        assertEquals(5, capacityService.remaining(frozenCell));
+        assertEquals(rid, rid); // 旧预占不受影响
+    }
+
+    /**
+     * 容量下调与预占确认的真正并发（余量充裕场景）：二者在同一库间行锁上串行，
+     * 多轮竞速允许双赢，但任何最终组合都必须满足容量 ≥ 在库+待入+已确认预占，
+     * 不允许出现死锁/锁超时，也不允许「提示成功、库里却是另一套」。
+     * 互斥结局（容量 0 对 满额预占）在 capacity_change_to_zero_vs_full_reservation_only_one_survives 中严格断言。
+     */
+    @Test
+    void capacity_change_and_reservation_confirm_race_never_violates_capacity() throws Exception {
+        int iterations = 15;
+        int bothWon = 0;
+        for (int i = 0; i < iterations; i++) {
+            String cargo = "竞速预占" + i;
+            Cell room = newRoom("RACE-" + i);
+            Reservation draft = createReservation(room.getId(), cargo, 30);
+            com.coldstore.freezer.dto.CellReq req = cellReq(room.getId(), 100);
+
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicInteger capOk = new AtomicInteger();
+            AtomicInteger confirmOk = new AtomicInteger();
+            AtomicReference<Throwable> unexpected = new AtomicReference<>();
+            List<Runnable> tasks = List.of(
+                    () -> {
+                        try {
+                            start.await();
+                            cellService.update(room.getId(), req);
+                            capOk.incrementAndGet();
+                        } catch (BizException expected) {
+                            // 落选方（该场景容量 100 ≥ 30，实际都会成功；保留驳回通道）
+                        } catch (Throwable e) {
+                            unexpected.set(e);
+                        }
+                    },
+                    () -> {
+                        try {
+                            start.await();
+                            reservationService.confirm(draft.getId());
+                            confirmOk.incrementAndGet();
+                        } catch (BizException expected) {
+                            // 落选方
+                        } catch (Throwable e) {
+                            unexpected.set(e);
+                        }
+                    });
+            if (i % 2 == 0) {
+                pool.submit(tasks.get(0));
+                pool.submit(tasks.get(1));
+            } else {
+                pool.submit(tasks.get(1));
+                pool.submit(tasks.get(0));
+            }
+            start.countDown();
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS),
+                    "第 " + i + " 轮并发动作未按时结束");
+            assertNull(unexpected.get(),
+                    "出现业务驳回以外的异常（死锁/锁超时/半截账）：" + unexpected.get());
+
+            int finalCapacity = dbCapacity(room.getId());
+            var view = capacityService.view(room.getId());
+            assertTrue(finalCapacity >= view.getReservedQty() + view.getPendingQty() + view.getInStockQty(),
+                    "第 " + i + " 轮：容量 " + finalCapacity + " 低于承诺下限 "
+                            + (view.getReservedQty() + view.getPendingQty() + view.getInStockQty()));
+            assertEquals(confirmOk.get() == 1 ? "已确认" : "待确认",
+                    reservationService.get(draft.getId()).getStatus());
+            assertEquals(capOk.get() == 1 ? 100 : 100, finalCapacity);
+            if (capOk.get() == 1 && confirmOk.get() == 1) {
+                bothWon++;
+            }
+        }
+        System.out.println("[race] 容量变更与预占确认并发 " + iterations + " 轮，双赢 " + bothWon
+                + " 轮，全部最终状态满足容量约束");
+    }
+
+    /**
+     * 确定性的互斥场景：预占要 100 箱（恰满），容量要下调到 0。
+     * 两者只有一个能成，且负方的驳回必须基于锁后最新口径，数字要说准。
+     */
+    @Test
+    void capacity_change_to_zero_vs_full_reservation_only_one_survives() throws Exception {
+        // 结局一：容量先改为 0，后到的确认看到剩余 0 被准确驳回
+        {
+            Cell room = newRoom("RACE-ZERO-A");
+            Reservation draft = createReservation(room.getId(), "满仓货", 100);
+            cellService.update(room.getId(), cellReq(room.getId(), 0));
+            BizException ex = assertThrows(BizException.class,
+                    () -> reservationService.confirm(draft.getId()));
+            assertTrue(ex.getMessage().contains("剩余可收 0 箱"), ex.getMessage());
+            assertEquals(0, dbCapacity(room.getId()));
+            assertEquals("待确认", reservationService.get(draft.getId()).getStatus());
+        }
+        // 结局二：预占先确认（占满 100），后到的容量下调 0 被驳回，容量不动
+        {
+            Cell room = newRoom("RACE-ZERO-B");
+            Reservation draft = createReservation(room.getId(), "满仓货", 100);
+            reservationService.confirm(draft.getId());
+            BizException ex = assertThrows(BizException.class,
+                    () -> cellService.update(room.getId(), cellReq(room.getId(), 0)));
+            assertTrue(ex.getMessage().contains("预占#" + draft.getId()),
+                    "驳回要点名撑住下限的那一笔预占：" + ex.getMessage());
+            assertTrue(ex.getMessage().contains("100"), ex.getMessage());
+            assertEquals(100, dbCapacity(room.getId()));
+            assertEquals("已确认", reservationService.get(draft.getId()).getStatus());
+            assertEquals(0, capacityService.remaining(room.getId()));
+        }
+
+        // 真正并发 10 轮：恰好一个成功，且不允许出现死锁/锁超时以外的意外
+        int capFirst = 0;
+        int confirmFirst = 0;
+        for (int i = 0; i < 20; i++) {
+            Cell room = newRoom("RACE-ZERO-C" + i);
+            Reservation draft = createReservation(room.getId(), "满仓货", 100);
+            com.coldstore.freezer.dto.CellReq req = cellReq(room.getId(), 0);
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicInteger capOk = new AtomicInteger();
+            AtomicInteger confirmOk = new AtomicInteger();
+            AtomicReference<Throwable> unexpected = new AtomicReference<>();
+            Runnable capTask = () -> {
+                try {
+                    start.await();
+                    // 模拟真实调度抖动：谁先在库间行锁队列里排队由系统调度决定，
+                    // 不由提交顺序决定（H2 行锁等待队列为 FIFO）
+                    Thread.sleep(java.util.concurrent.ThreadLocalRandom.current().nextInt(0, 20));
+                    cellService.update(room.getId(), req);
+                    capOk.incrementAndGet();
+                } catch (BizException expected) {
+                    // 确认先到，下限 100 > 0
+                } catch (Throwable e) {
+                    unexpected.set(e);
+                }
+            };
+            Runnable confirmTask = () -> {
+                try {
+                    start.await();
+                    Thread.sleep(java.util.concurrent.ThreadLocalRandom.current().nextInt(0, 20));
+                    reservationService.confirm(draft.getId());
+                    confirmOk.incrementAndGet();
+                } catch (BizException expected) {
+                    // 容量先改为 0，剩余 0 < 100
+                } catch (Throwable e) {
+                    unexpected.set(e);
+                }
+            };
+            if (i % 2 == 0) { pool.submit(capTask); pool.submit(confirmTask); }
+            else { pool.submit(confirmTask); pool.submit(capTask); }
+            start.countDown();
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, java.util.concurrent.TimeUnit.SECONDS));
+            assertNull(unexpected.get(), "第 " + i + " 轮意外异常：" + unexpected.get());
+            assertEquals(1, capOk.get() + confirmOk.get(),
+                    "第 " + i + " 轮必须恰好一个成功，capOk=" + capOk + " confirmOk=" + confirmOk);
+            int finalCapacity = dbCapacity(room.getId());
+            int reserved = capacityService.view(room.getId()).getReservedQty();
+            assertTrue(finalCapacity >= reserved,
+                    "容量不得低于已确认预占：capacity=" + finalCapacity + " reserved=" + reserved);
+            if (capOk.get() == 1) {
+                capFirst++;
+                assertEquals(0, finalCapacity);
+                assertEquals("待确认", reservationService.get(draft.getId()).getStatus());
+            } else {
+                confirmFirst++;
+                assertEquals(100, finalCapacity);
+                assertEquals("已确认", reservationService.get(draft.getId()).getStatus());
+            }
+        }
+        System.out.println("[race] 互斥竞速：容量先赢 " + capFirst + " 轮，预占确认先赢 " + confirmFirst + " 轮");
+        assertTrue(capFirst > 0 && confirmFirst > 0,
+                "两种加锁先后都必须真实跑到：容量先赢 " + capFirst + "，确认先赢 " + confirmFirst);
+    }
+
+    private Cell newRoom(String code) {
+        Cell room = new Cell();
+        room.setCode(code);
+        room.setName(code);
+        room.setTempZone("冷冻");
+        room.setCapacity(100);
+        room.setDeleted(0);
+        return cellRepository.save(room);
     }
 
     // ---------- 预占确认 ----------

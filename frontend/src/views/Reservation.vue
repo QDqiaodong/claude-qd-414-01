@@ -162,9 +162,14 @@ async function create() {
 }
 
 async function confirmRow(row) {
-  // 被挤掉时后端会在 message 里说清当时还剩多少箱，拦截器已弹错
-  await http.put('/reservations/' + row.id + '/confirm')
-  await load()
+  // 被挤掉时后端会在 message 里说清当时还剩多少箱，拦截器已弹错。
+  // 容量变更可能与确认同时发生：成功或被驳回都整页刷新（容量总览、预占状态、
+  // 库间卡片一律以后端串行点判定后的最新数据为准，旧页面不保留任何过期口径）。
+  try {
+    await http.put('/reservations/' + row.id + '/confirm')
+  } finally {
+    await load()
+  }
 }
 
 async function remove(row) {

@@ -18,6 +18,9 @@ public interface ReservationRepository extends JpaRepository<Reservation, Long> 
 
     List<Reservation> findByCellIdOrderByIdDesc(Long cellId);
 
+    /** 某库间已确认尚未核销的预占逐笔清单：容量变更驳回时点明是哪一笔承诺顶到了新容量之上 */
+    List<Reservation> findByCellIdAndStatusOrderByIdAsc(Long cellId, String status);
+
     /** 该库间已确认尚未核销的预占箱数合计 */
     @Query("select coalesce(sum(r.qty), 0) from Reservation r " +
             "where r.cellId = :cellId and r.status = '已确认'")
