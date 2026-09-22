@@ -1,5 +1,6 @@
 package com.coldstore.freezer;
 
+import com.coldstore.freezer.dto.BizException;
 import com.coldstore.freezer.dto.CellReq;
 import com.coldstore.freezer.dto.ReservationReq;
 import com.coldstore.freezer.entity.Batch;
