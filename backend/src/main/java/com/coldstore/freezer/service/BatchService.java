@@ -46,11 +46,20 @@ public class BatchService {
         }
     }
 
+    /**
+     * 开立待入批次：待入箱数计入容量承诺下限。
+     * 同样先锁库间行，与容量变更、预占确认走同一串行点，
+     * 保证「容量下调」不会和「新待入批次」互相覆盖出新容量小于承诺量的结果。
+     */
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public Batch create(BatchReq req) {
         if (req.getCellId() == null) {
             throw new BizException("归属库间不能为空");
         }
-        assertCellValid(req.getCellId());
+        Cell cell = cellRepository.findActiveByIdForUpdate(req.getCellId()).orElse(null);
+        if (cell == null) {
+            throw new BizException("归属库间不存在或已删除");
+        }
         if (req.getCargo() == null || req.getCargo().isBlank()) {
             throw new BizException("货品名不能为空");
         }
@@ -58,7 +67,7 @@ public class BatchService {
             throw new BizException("入库必须填写数量");
         }
         Batch batch = new Batch();
-        batch.setCellId(req.getCellId());
+        batch.setCellId(cell.getId());
         batch.setCargo(req.getCargo());
         batch.setQty(req.getQty());
         batch.setBatchDate(req.getBatchDate() == null ? LocalDate.now() : req.getBatchDate());

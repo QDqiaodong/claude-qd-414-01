@@ -162,9 +162,14 @@ async function create() {
 }
 
 async function confirmRow(row) {
-  // 被挤掉时后端会在 message 里说清当时还剩多少箱，拦截器已弹错
-  await http.put('/reservations/' + row.id + '/confirm')
-  await load()
+  // 与容量下调并发时，后到的确认可能被新容量口径驳回；错误提示已由拦截器弹出。
+  // 无论确认成功还是被驳回，都重查预占单与容量总览，对齐锁内最终结果，
+  // 不保留旧页面上的旧剩余箱数/旧容量数字。
+  try {
+    await http.put('/reservations/' + row.id + '/confirm')
+  } finally {
+    await load()
+  }
 }
 
 async function remove(row) {
